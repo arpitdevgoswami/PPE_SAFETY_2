@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -23,6 +24,59 @@ from server.config import (
 )
 
 logger = logging.getLogger("smartppe.camera")
+
+
+def get_candidate_stream_urls(url: str) -> list[str]:
+    """
+    Generate candidate URLs for IP/phone cameras based on common streaming apps.
+    Supports IP Webcam (Android), DroidCam, RTSP streams, and standard HTTP/HTTPS MJPEG.
+    """
+    cleaned = url.strip().strip('"').strip("'")
+    if not cleaned:
+        return []
+
+    # If already RTSP or HTTPS or custom scheme
+    if cleaned.startswith("rtsp://") or cleaned.startswith("rtsps://"):
+        return [cleaned]
+
+    # Prepend http:// if missing
+    if not cleaned.startswith("http://") and not cleaned.startswith("https://"):
+        cleaned = f"http://{cleaned}"
+
+    parsed = urlparse(cleaned)
+    path = parsed.path.rstrip("/")
+
+    candidates = []
+    if path and path not in ("", "/"):
+        candidates.append(cleaned)
+        return candidates
+
+    # Path is empty or root — generate smart fallbacks based on common ports & apps
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    port = parsed.port
+
+    if port == 8080:  # IP Webcam (Pavel Khlebovich / Android standard)
+        candidates.extend([
+            f"{base}/video",
+            f"{base}/video/mjpg.cgi",
+            f"{base}/mjpegfeed",
+            f"{base}/",
+        ])
+    elif port == 4747:  # DroidCam
+        candidates.extend([
+            f"{base}/video",
+            f"{base}/mjpegfeed",
+            f"{base}/",
+        ])
+    else:
+        candidates.extend([
+            f"{base}/video",
+            f"{base}/mjpegfeed",
+            f"{base}/video/mjpg.cgi",
+            f"{base}/",
+        ])
+
+    return candidates
 
 
 class CameraSource:
@@ -95,28 +149,67 @@ class CameraSource:
         self._stop_event.clear()
 
         try:
+            cap = None
+            working_source = source
+
             if isinstance(source, int):
                 cap = cv2.VideoCapture(source, cv2.CAP_MSMF)
+                if not cap.isOpened():
+                    cap.release()
+                    cap = cv2.VideoCapture(source)
             else:
-                cap = cv2.VideoCapture(source)
+                # String source (IP / Phone / RTSP URL)
+                candidates = get_candidate_stream_urls(str(source))
+                logger.info("[%s] Testing candidate stream URLs: %s", self.camera_id, candidates)
 
-            if not cap.isOpened():
-                self._error = f"Cannot open source: {source}"
+                for cand in candidates:
+                    logger.info("[%s] Attempting connection to %s", self.camera_id, cand)
+                    temp_cap = cv2.VideoCapture(cand)
+                    try:
+                        temp_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
+
+                    if temp_cap.isOpened():
+                        # Verify we can actually read a valid frame
+                        ret, test_frame = temp_cap.read()
+                        if ret and test_frame is not None and test_frame.size > 0:
+                            cap = temp_cap
+                            working_source = cand
+                            logger.info("[%s] Successfully verified stream at %s", self.camera_id, cand)
+                            with self._lock:
+                                self._frame = test_frame
+                                self._frame_time = datetime.now(timezone.utc)
+                            break
+                        else:
+                            temp_cap.release()
+                    else:
+                        temp_cap.release()
+
+            if cap is None or not cap.isOpened():
+                self._error = f"Cannot open camera source: {source}. Ensure phone/webcam is streaming on the same network."
                 logger.error("[%s] %s", self.camera_id, self._error)
                 return False
 
-            # Set resolution (best-effort)
+            # Set resolution / buffer optimizations
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
             self._cap = cap
-            self._frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self._frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self._source = working_source
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self._frame_width = w if w > 0 else (self._frame.shape[1] if self._frame is not None else 640)
+            self._frame_height = h if h > 0 else (self._frame.shape[0] if self._frame is not None else 480)
             self._connected = True
 
             logger.info(
                 "[%s] Connected to %s (%dx%d)",
-                self.camera_id, source, self._frame_width, self._frame_height,
+                self.camera_id, working_source, self._frame_width, self._frame_height,
             )
 
             # Start capture thread
@@ -160,7 +253,7 @@ class CameraSource:
     def _capture_loop(self) -> None:
         """Continuously capture frames until stopped."""
         consecutive_failures = 0
-        max_failures = 30
+        max_failures = 45
 
         while not self._stop_event.is_set():
             if self._cap is None or not self._cap.isOpened():
@@ -174,11 +267,11 @@ class CameraSource:
             if not ret or frame is None or frame.size == 0:
                 consecutive_failures += 1
                 if consecutive_failures >= max_failures:
-                    self._error = f"Too many consecutive read failures ({max_failures})"
+                    self._error = f"Camera connection timed out ({max_failures} missed frames)"
                     self._connected = False
                     logger.error("[%s] %s", self.camera_id, self._error)
                     break
-                time.sleep(0.05)
+                time.sleep(0.04)
                 continue
 
             consecutive_failures = 0
@@ -189,8 +282,8 @@ class CameraSource:
                 self._frame_time = now
                 self._error = None
 
-            # Small sleep to avoid CPU spin (~30 captures/s max)
-            time.sleep(0.033)
+            # Small sleep to maintain reasonable frame rate without starving CPU
+            time.sleep(0.02)
 
         logger.info("[%s] Capture loop ended", self.camera_id)
 
@@ -224,7 +317,7 @@ class CameraManager:
     def connect_phone(self, url: str | None = None) -> bool:
         stream_url = url or PHONE_CAMERA_URL
         if not stream_url:
-            self.phone._error = "No phone camera URL configured"
+            self.phone._error = "No phone camera URL configured. Please enter IP Webcam or RTSP URL."
             logger.warning("[phone] No URL provided")
             return False
         return self.phone.connect(stream_url)

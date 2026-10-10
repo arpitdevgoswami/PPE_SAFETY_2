@@ -2,15 +2,12 @@
  * LiveCameraPanel — displays real camera streams from the backend
  * with live detection overlays and camera controls.
  *
- * Inserted at the top of the LiveMonitoringPage without changing
- * any existing demo camera tiles below.
+ * Supports Laptop Webcam and Phone IP Camera (IP Webcam, DroidCam, RTSP, etc.).
  */
 
-import React, { useState, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Video,
   VideoOff,
-  Wifi,
   WifiOff,
   AlertTriangle,
   ShieldCheck,
@@ -18,24 +15,36 @@ import {
   Wind,
   Smartphone,
   Monitor,
-  Loader,
+  Loader2,
   Zap,
+  HelpCircle,
 } from 'lucide-react';
 import { streamUrl } from '../api/config';
 import { useCameras, useDetections, useBackendStatus } from '../hooks/useBackend';
 import type { DetectionResult } from '../api/client';
+
+const STORAGE_KEY_PHONE_URL = 'smartppe_phone_camera_url';
 
 export const LiveCameraPanel: React.FC = () => {
   const { data: cameras, connect, disconnect } = useCameras();
   const { data: detections } = useDetections();
   const { data: status, error: backendError } = useBackendStatus();
 
-  const [phoneUrl, setPhoneUrl] = useState('');
-  const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [phoneUrl, setPhoneUrl] = useState<string>(() => {
+    return localStorage.getItem(STORAGE_KEY_PHONE_URL) || '';
+  });
+  const [isConnecting, setIsConnecting] = useState<string | null>(null);
+  const [actionMsg, setActionMsg] = useState<{ text: string; isError?: boolean } | null>(null);
 
-  const showMsg = useCallback((msg: string) => {
-    setActionMsg(msg);
-    setTimeout(() => setActionMsg(null), 3000);
+  // Sync phoneUrl to local storage
+  const updatePhoneUrl = (url: string) => {
+    setPhoneUrl(url);
+    localStorage.setItem(STORAGE_KEY_PHONE_URL, url);
+  };
+
+  const showMsg = useCallback((text: string, isError: boolean = false) => {
+    setActionMsg({ text, isError });
+    setTimeout(() => setActionMsg(null), 4000);
   }, []);
 
   const laptopCam = cameras?.find((c) => c.camera_id === 'laptop');
@@ -44,18 +53,29 @@ export const LiveCameraPanel: React.FC = () => {
   const phoneDet = detections?.find((d) => d.camera_id === 'phone') ?? null;
 
   const handleConnect = async (id: string) => {
-    if (id === 'phone' && phoneUrl) {
-      const r = await connect(id, { url: phoneUrl });
-      showMsg(r.message);
-    } else {
-      const r = await connect(id);
-      showMsg(r.message);
+    setIsConnecting(id);
+    try {
+      if (id === 'phone') {
+        const targetUrl = phoneUrl.trim();
+        if (!targetUrl && !phoneCam?.source) {
+          showMsg('Please enter your Phone Camera IP / URL first', true);
+          setIsConnecting(null);
+          return;
+        }
+        const r = await connect(id, targetUrl ? { url: targetUrl } : undefined);
+        showMsg(r.message, !r.success);
+      } else {
+        const r = await connect(id);
+        showMsg(r.message, !r.success);
+      }
+    } finally {
+      setIsConnecting(null);
     }
   };
 
   const handleDisconnect = async (id: string) => {
     const r = await disconnect(id);
-    showMsg(r.message);
+    showMsg(r.message, !r.success);
   };
 
   // Backend not reachable
@@ -86,13 +106,19 @@ export const LiveCameraPanel: React.FC = () => {
       {actionMsg && (
         <div style={{
           position: 'fixed', top: '70px', right: '24px', zIndex: 1000,
-          backgroundColor: 'var(--surface-3)', border: '1px solid var(--accent-border)',
-          borderRadius: '8px', padding: '10px 18px', color: 'var(--text-primary)',
+          backgroundColor: 'var(--surface-3)',
+          border: `1px solid ${actionMsg.isError ? 'var(--danger-border)' : 'var(--accent-border)'}`,
+          borderRadius: '8px', padding: '10px 18px',
+          color: actionMsg.isError ? 'var(--danger)' : 'var(--text-primary)',
           fontSize: '13px', display: 'flex', alignItems: 'center', gap: '10px',
           boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
         }}>
-          <Zap size={15} style={{ color: 'var(--accent)' }} />
-          <span>{actionMsg}</span>
+          {actionMsg.isError ? (
+            <AlertTriangle size={15} style={{ color: 'var(--danger)' }} />
+          ) : (
+            <Zap size={15} style={{ color: 'var(--accent)' }} />
+          )}
+          <span>{actionMsg.text}</span>
         </div>
       )}
 
@@ -136,6 +162,7 @@ export const LiveCameraPanel: React.FC = () => {
           icon={<Monitor size={14} />}
           cam={laptopCam ?? null}
           detection={laptopDet}
+          loading={isConnecting === 'laptop'}
           onConnect={() => handleConnect('laptop')}
           onDisconnect={() => handleDisconnect('laptop')}
         />
@@ -147,25 +174,78 @@ export const LiveCameraPanel: React.FC = () => {
           icon={<Smartphone size={14} />}
           cam={phoneCam ?? null}
           detection={phoneDet}
+          loading={isConnecting === 'phone'}
           onConnect={() => handleConnect('phone')}
           onDisconnect={() => handleDisconnect('phone')}
           phoneUrlInput={
             !phoneCam?.connected ? (
-              <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
-                <input
-                  type="text"
-                  placeholder="http://192.168.x.x:8080/video"
-                  value={phoneUrl}
-                  onChange={(e) => setPhoneUrl(e.target.value)}
-                  style={{
-                    flex: 1, padding: '4px 8px', borderRadius: '4px',
-                    backgroundColor: 'var(--surface-0)', border: '1px solid var(--border-subtle)',
-                    color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: '11px',
-                    outline: 'none',
-                  }}
-                  onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-                  onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
-                />
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '90%', maxWidth: '340px' }}>
+                <div style={{ display: 'flex', gap: '6px' }}>
+                  <input
+                    type="text"
+                    placeholder="http://192.168.1.X:8080/video"
+                    value={phoneUrl}
+                    onChange={(e) => updatePhoneUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleConnect('phone');
+                    }}
+                    style={{
+                      flex: 1, padding: '6px 10px', borderRadius: '4px',
+                      backgroundColor: 'var(--surface-0)', border: '1px solid var(--border-subtle)',
+                      color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: '11px',
+                      outline: 'none',
+                    }}
+                    onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
+                    onBlur={(e) => { e.currentTarget.style.borderColor = 'var(--border-subtle)'; }}
+                  />
+                  <button
+                    onClick={() => handleConnect('phone')}
+                    disabled={isConnecting === 'phone'}
+                    style={{
+                      padding: '4px 12px', borderRadius: '4px',
+                      backgroundColor: 'var(--accent)', color: '#000',
+                      border: 'none', fontFamily: 'var(--font-mono)', fontSize: '11px',
+                      fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'
+                    }}
+                  >
+                    {isConnecting === 'phone' ? <Loader2 size={12} className="animate-spin" /> : 'CONNECT'}
+                  </button>
+                </div>
+                <div style={{
+                  display: 'flex', flexWrap: 'wrap', gap: '4px',
+                  alignItems: 'center', fontSize: '10px', color: 'var(--text-tertiary)',
+                  fontFamily: 'var(--font-mono)',
+                }}>
+                  <span>Quick format:</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const ipMatch = phoneUrl.match(/\d+\.\d+\.\d+\.\d+/);
+                      const ip = ipMatch ? ipMatch[0] : '192.168.1.X';
+                      updatePhoneUrl(`http://${ip}:8080/video`);
+                    }}
+                    style={{
+                      background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
+                      color: 'var(--accent)', padding: '1px 5px', borderRadius: '3px', cursor: 'pointer', fontSize: '10px'
+                    }}
+                  >
+                    IP Webcam (:8080)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const ipMatch = phoneUrl.match(/\d+\.\d+\.\d+\.\d+/);
+                      const ip = ipMatch ? ipMatch[0] : '192.168.1.X';
+                      updatePhoneUrl(`http://${ip}:4747/video`);
+                    }}
+                    style={{
+                      background: 'var(--surface-2)', border: '1px solid var(--border-subtle)',
+                      color: 'var(--accent)', padding: '1px 5px', borderRadius: '3px', cursor: 'pointer', fontSize: '10px'
+                    }}
+                  >
+                    DroidCam (:4747)
+                  </button>
+                </div>
               </div>
             ) : undefined
           }
@@ -182,15 +262,16 @@ interface CameraTileProps {
   cameraId: string;
   label: string;
   icon: React.ReactNode;
-  cam: { connected: boolean; error: string | null; frame_width: number | null; frame_height: number | null } | null;
+  cam: { connected: boolean; error: string | null; frame_width: number | null; frame_height: number | null; source?: string } | null;
   detection: DetectionResult | null;
+  loading?: boolean;
   onConnect: () => void;
   onDisconnect: () => void;
   phoneUrlInput?: React.ReactNode;
 }
 
 const CameraTile: React.FC<CameraTileProps> = ({
-  cameraId, label, icon, cam, detection, onConnect, onDisconnect, phoneUrlInput,
+  cameraId, label, icon, cam, detection, loading, onConnect, onDisconnect, phoneUrlInput,
 }) => {
   const connected = cam?.connected ?? false;
   const error = cam?.error ?? null;
@@ -252,10 +333,14 @@ const CameraTile: React.FC<CameraTileProps> = ({
         ) : (
           <div style={{
             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px',
-            color: 'var(--text-disabled)',
+            color: 'var(--text-disabled)', textAlign: 'center', padding: '16px',
           }}>
-            <VideoOff size={32} strokeWidth={1} />
-            <span style={{ fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
+            <VideoOff size={30} strokeWidth={1} />
+            <span style={{
+              fontFamily: 'var(--font-mono)', fontSize: '11px',
+              color: error ? 'var(--danger)' : 'var(--text-secondary)',
+              maxWidth: '360px',
+            }}>
               {error || 'NOT CONNECTED'}
             </span>
             {phoneUrlInput}
@@ -317,16 +402,19 @@ const CameraTile: React.FC<CameraTileProps> = ({
         </span>
         <button
           onClick={connected ? onDisconnect : onConnect}
+          disabled={loading}
           style={{
-            padding: '3px 10px', borderRadius: '4px', border: 'none',
+            padding: '4px 12px', borderRadius: '4px', border: 'none',
             backgroundColor: connected ? 'var(--danger-dim)' : 'var(--success-dim)',
             color: connected ? 'var(--danger)' : 'var(--success)',
             fontFamily: 'var(--font-mono)', fontSize: '10px', fontWeight: 600,
-            cursor: 'pointer',
+            cursor: loading ? 'not-allowed' : 'pointer',
             borderWidth: '1px', borderStyle: 'solid',
             borderColor: connected ? 'var(--danger-border)' : 'var(--success-border)',
+            display: 'flex', alignItems: 'center', gap: '4px',
           }}
         >
+          {loading && <Loader2 size={10} className="animate-spin" />}
           {connected ? 'DISCONNECT' : 'CONNECT'}
         </button>
       </div>

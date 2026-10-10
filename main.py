@@ -35,9 +35,10 @@ print("   AI PPE & FIRE/SMOKE SAFETY SYSTEM")
 print("==========================================")
 print("1. Live Webcam")
 print("2. Video File")
+print("3. Phone Camera (IP Webcam / RTSP / DroidCam)")
 print("==========================================")
 
-choice = input("Enter choice (1/2): ").strip()
+choice = input("Enter choice (1/2/3): ").strip()
 
 
 # ============================================================
@@ -49,6 +50,9 @@ if choice == "1":
     print("\nOpening webcam...")
 
     cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(0)
 
     mode_name = "LIVE WEBCAM"
 
@@ -82,10 +86,73 @@ elif choice == "2":
     print("Video opened successfully.")
 
 
+elif choice == "3":
+
+    print("\nPhone Camera Stream Setup:")
+    print("Examples:")
+    print(" - Android IP Webcam: http://192.168.1.X:8080/video")
+    print(" - DroidCam:          http://192.168.1.X:4747/video")
+    print(" - RTSP Stream:       rtsp://192.168.1.X:554/live")
+    print("------------------------------------------")
+
+    raw_url = input("Enter phone IP or stream URL: ").strip().strip('"').strip("'")
+    if not raw_url:
+        print("ERROR: No URL entered.")
+        exit()
+
+    # Candidate URL generator
+    if raw_url.startswith("rtsp://") or raw_url.startswith("rtsps://"):
+        candidates = [raw_url]
+    else:
+        norm = raw_url if raw_url.startswith("http://") or raw_url.startswith("https://") else f"http://{raw_url}"
+        from urllib.parse import urlparse
+        p = urlparse(norm)
+        base = f"{p.scheme}://{p.netloc}"
+        if p.path and p.path not in ("", "/"):
+            candidates = [norm]
+        elif p.port == 8080:
+            candidates = [f"{base}/video", f"{base}/video/mjpg.cgi", f"{base}/mjpegfeed", f"{base}/"]
+        elif p.port == 4747:
+            candidates = [f"{base}/video", f"{base}/mjpegfeed", f"{base}/"]
+        else:
+            candidates = [f"{base}/video", f"{base}/mjpegfeed", f"{base}/video/mjpg.cgi", f"{base}/"]
+
+    print(f"\nConnecting to phone camera stream...")
+    cap = None
+    for cand in candidates:
+        print(f"Testing: {cand}")
+        temp_cap = cv2.VideoCapture(cand)
+        try:
+            temp_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        if temp_cap.isOpened():
+            ret, test_frame = temp_cap.read()
+            if ret and test_frame is not None and test_frame.size > 0:
+                cap = temp_cap
+                print(f"Successfully connected to {cand}")
+                break
+            else:
+                temp_cap.release()
+        else:
+            temp_cap.release()
+
+    mode_name = "PHONE CAMERA"
+
+    if cap is None or not cap.isOpened():
+        print("\nERROR: Could not open phone camera stream.")
+        print("Please ensure your phone and PC are connected to the SAME Wi-Fi network")
+        print("and the IP Webcam / streaming app is active on your phone.")
+        exit()
+
+    print("Phone camera stream opened successfully.")
+
+
 else:
 
     print("\nInvalid choice.")
-    print("Please run the program again and select 1 or 2.")
+    print("Please run the program again and select 1, 2, or 3.")
     exit()
 
 
